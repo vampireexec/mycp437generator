@@ -21,6 +21,10 @@ struct Args {
 
     /// Output PNG file path
     output: PathBuf,
+
+    /// Dump hex bitmap to console instead of saving image
+    #[arg(long)]
+    hex_dump: bool,
 }
 
 // CP437 character mapping
@@ -190,7 +194,86 @@ fn get_cp437_char(index: u8) -> char {
         255 => ' ', // Non-breaking space
     }
 }
+/// Convert a surface to hex dump format
+/// Each scanline is padded to a 32-bit boundary so that font_bitmask
+/// can use (x % 32) directly without needing the Y coordinate.
+fn dump_surface_as_hex(surface: &Surface, char_width: u32, char_height: u32) -> Result<()> {
+    let width = surface.width();
+    let height = surface.height();
+    // Padded width: round up to the next multiple of 32
+    let padded_width = ((width + 31) / 32) * 32;
 
+    eprintln!("// Pixel dimensions: {} wide x {} tall", width, height);
+    eprintln!(
+        "// Padded scanline width (map_w for shader): {}",
+        padded_width
+    );
+    eprintln!("// Character grid: 16x16");
+    eprintln!("// Character cell: {}x{} pixels", char_width, char_height);
+    eprintln!("// Packing: per-row, 32-bit aligned");
+    eprintln!();
+
+    // Lock the surface to access pixel data
+    surface.with_lock(|pixels: &[u8]| {
+        let pitch = surface.pitch() as usize;
+        let bytes_per_pixel = surface.pixel_format().bytes_per_pixel() as usize;
+
+        let mut all_values: Vec<u32> = Vec::new();
+
+        for y in 0..height as usize {
+            // Collect bits for this scanline
+            let mut bits: Vec<bool> = Vec::with_capacity(padded_width as usize);
+
+            for x in 0..width as usize {
+                let pixel_offset = y * pitch + x * bytes_per_pixel;
+
+                let is_filled = if pixel_offset + 2 < pixels.len() {
+                    let r = pixels[pixel_offset];
+                    let g = pixels[pixel_offset + 1];
+                    let b = pixels[pixel_offset + 2];
+                    let brightness = (r as u32 + g as u32 + b as u32) / 3;
+                    brightness < 128
+                } else {
+                    false
+                };
+
+                bits.push(is_filled);
+            }
+
+            // Pad to 32-bit boundary with zeros
+            while bits.len() < padded_width as usize {
+                bits.push(false);
+            }
+
+            // Pack into 32-bit integers
+            for chunk in bits.chunks(32) {
+                let mut value: u32 = 0;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    if bit {
+                        value |= 1 << i;
+                    }
+                }
+                all_values.push(value);
+            }
+        }
+
+        // Print 8 values per line for readability
+        for (i, value) in all_values.iter().enumerate() {
+            if i % 8 == 0 {
+                if i > 0 {
+                    println!();
+                }
+                print!("  ");
+            } else {
+                print!(" ");
+            }
+            print!("0x{:08X} ", value);
+        }
+        println!();
+    });
+
+    Ok(())
+}
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -200,73 +283,65 @@ fn main() -> Result<()> {
     // Initialize SDL3 TTF
     let ttf_context = sdl3::ttf::init().context("Failed to initialize SDL2_ttf")?;
 
-    // Calculate font size to achieve pixel-perfect height
-    // Use iterative refinement for accurate sizing
-    let mut font_size = args.font_height as f32 * 0.75;
-    let desired_height = args.font_height as f32;
+    // --- Step 1: Find the right font size ---
+    // We want the font's rendered height (ascent - descent) == font_height.
+    // No vertical padding — the cell height matches the metric height exactly.
+    let mut font_size = 1.0; // Start with a reasonable default size
+    let cp437chars_string = (32..=126).map(get_cp437_char).collect::<String>();
 
-    // Iteratively adjust font size to get exact pixel height
-    for iteration in 0..15 {
+    for iteration in 1..45 {
+        font_size = 45.0 - iteration as f32;
+
         let mut font = ttf_context
             .load_font(&args.font_path, font_size)
             .context("Failed to load font")?;
+        font.set_hinting(sdl3::ttf::Hinting::NONE);
 
-        // Disable hinting for pixel-perfect rendering
-        font.set_hinting(sdl3::ttf::Hinting::MONO);
+        let texture = font
+            .render(&cp437chars_string)
+            .solid(Color::RGB(0, 0, 0))
+            .context("Failed to render text for size estimation")?;
+        let total_height = texture.height() as i32; // Total vertical space needed for baseline alignment
 
-        // Measure actual rendered height with a test character
-        let test_surface = font
-            .render("M")
-            .solid(Color::RGB(255, 255, 255))
-            .context("Failed to render test character")?;
-
-        let actual_height = test_surface.height() as f32;
-        let height_error = (actual_height - desired_height).abs();
-
-        eprintln!(
-            "Iteration {}: font_size={:.4}, actual_height={:.2}, target={}, error={:.2}",
-            iteration, font_size, actual_height, args.font_height, height_error
-        );
-
-        // If we're within 0.5 pixels, we're close enough
-        if height_error < 0.5 {
+        if total_height <= args.font_height as i32 {
+            font_size += 1.0; // Step back to the last size that fit
             break;
         }
-
-        // Adjust font size based on error
-        let scale_factor = desired_height / actual_height;
-        font_size *= scale_factor;
     }
 
-    // Load final font
+    // --- Step 2: Load final font and log metrics ---
     let mut font = ttf_context
         .load_font(&args.font_path, font_size)
         .context("Failed to load font with adjusted size")?;
-
-    // Disable hinting for pixel-perfect rendering
     font.set_hinting(sdl3::ttf::Hinting::MONO);
 
     eprintln!(
-        "Final font size: {:.4} pt for target height {}",
-        font_size, args.font_height
+        "Final: font_size={:.4}pt, ascent={}, descent={}, height={}",
+        font_size,
+        font.ascent(),
+        font.descent(),
+        font.height()
+    );
+    eprintln!(
+        "Cell: {}x{} (horizontal centering, baseline-aligned vertically)",
+        args.font_width, args.font_height
     );
 
     // Create the atlas surface (16x16 grid)
     let atlas_width = args.font_width * 16;
     let atlas_height = args.font_height * 16;
 
-    let mut atlas = Surface::new(
-        atlas_width,
-        atlas_height,
-        sdl3::pixels::PixelFormat::RGBA8888,
-    )?;
+    let mut atlas = Surface::new(atlas_width, atlas_height, sdl3::pixels::PixelFormat::RGB24)?;
 
-    // Fill with transparent background
+    // Fill with solid background
     atlas
-        .fill_rect(None, Color::RGBA(225, 225, 255, 255))
+        .fill_rect(None, Color::RGB(255, 255, 255))
         .context("unable to fill rect")?;
 
-    // Render each CP437 character
+    // --- Step 3: Render each CP437 character ---
+    // SDL_ttf's solid() renderer already positions glyphs with the baseline at
+    // y=ascent from the top of the surface. So we just blit at y=0 in each cell
+    // and all characters will be baseline-aligned automatically.
     for i in 0..=u8::MAX {
         let ch = get_cp437_char(i);
         let char_str = ch.to_string();
@@ -283,11 +358,10 @@ fn main() -> Result<()> {
             }
         };
 
-        // Skip characters with zero dimensions (not in font or whitespace)
-        let char_width = text_surface.width();
-        let char_height = text_surface.height();
+        let glyph_w = text_surface.width();
+        let glyph_h = text_surface.height();
 
-        if char_width == 0 || char_height == 0 {
+        if glyph_w == 0 || glyph_h == 0 {
             eprintln!(
                 "Skipping character '{}' (index {}) - zero dimensions",
                 ch, i
@@ -299,35 +373,38 @@ fn main() -> Result<()> {
         let grid_x = (i % 16) as u32;
         let grid_y = (i / 16) as u32;
 
-        // Calculate cell position
-        let cell_x = grid_x * args.font_width;
-        let cell_y = grid_y * args.font_height;
+        // Top-left of cell in atlas
+        let cell_x = (grid_x * args.font_width) as i32;
+        let cell_y = (grid_y * args.font_height) as i32;
 
-        // Center the character in the cell
+        // Horizontal: center glyph in cell
+        let offset_x = (args.font_width as i32 - glyph_w as i32) / 2;
 
-        let offset_x = if char_width < args.font_width {
-            (args.font_width - char_width) / 2
-        } else {
-            0
-        };
+        // Vertical: blit at top of cell (SDL_ttf already handles baseline positioning)
+        let offset_y = 0;
 
-        let offset_y = if char_height < args.font_height {
-            (args.font_height - char_height) / 2
-        } else {
-            0
-        };
-
-        let dest_rect = Rect::new(
-            (cell_x + offset_x) as i32,
-            (cell_y + offset_y) as i32,
-            char_width.min(args.font_width),
-            char_height.min(args.font_height),
-        );
+        let dest_rect = Rect::new(cell_x + offset_x, cell_y + offset_y, glyph_w, glyph_h);
+        if dest_rect.width() > args.font_width
+            || dest_rect.height() > args.font_height
+            || dest_rect.x() + dest_rect.width() as i32 > cell_x + args.font_width as i32
+            || dest_rect.y() + dest_rect.height() as i32 > cell_y + args.font_height as i32
+        {
+            eprintln!(
+                "Warning: character '{}' (index {}) exceeds cell size - dest_rect={:?} cell_x={}, cell_y={} offset_x={}, offset_y={}",
+                ch, i, dest_rect, cell_x, cell_y, offset_x, offset_y
+            );
+        }
 
         // Blit the character to the atlas
         text_surface.blit(None, &mut atlas, Some(dest_rect))?;
     }
-    atlas.save(&args.output).context("Failed to save PNG")?;
-    println!("Font atlas saved to {}", args.output.display());
+
+    if args.hex_dump {
+        dump_surface_as_hex(&atlas, args.font_width, args.font_height)?;
+    } else {
+        atlas.save(&args.output).context("Failed to save PNG")?;
+        println!("Font atlas saved to {}", args.output.display());
+    }
+
     Ok(())
 }
